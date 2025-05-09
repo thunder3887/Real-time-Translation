@@ -11,3 +11,6 @@
 
 ## whisper和Sakura-Qwen2.5本地路徑自行更改，模型大小依照顯存自行決定
 建議whisper-large-turbo以上，建議Sakura-Qwen2.5 7B-Q4以上
+
+## GUI
+![示意圖](example.png)
