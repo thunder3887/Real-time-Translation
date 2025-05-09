@@ -4,7 +4,6 @@ import threading
 import queue
 import torch
 import time
-import webrtcvad
 from datetime import datetime
 import tkinter as tk
 from tkinter.scrolledtext import ScrolledText
@@ -13,6 +12,9 @@ import json
 import os
 import resampy
 import soundfile as sf
+import gc
+
+import webrtcvad
 
 from demucs.pretrained import get_model as demucs_get_model
 from demucs.apply import apply_model as demucs_apply_model
@@ -25,7 +27,10 @@ from transformers import (
 
 from llama_cpp import Llama
 
-# ========== 視窗固定 ==========
+qwen_gguf_path = "./sakura-7b-qwen2.5-v1.0-q6k.gguf"    # Qwen2.5 GGUF 模型路徑
+hf_whisper_path = "./turbo"                             # Whisper large-turbo 模型路徑
+
+# ---------- 視窗固定 ----------
 import ctypes
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(2)  
@@ -50,15 +55,47 @@ def load_paddleocr():
         from paddleocr import PaddleOCR
         # 根據需要調整 lang 參數，如 "japan", "en", "ch" 等
         paddleocr_model = PaddleOCR(use_angle_cls=True, lang="japan")
+        update_unload_button_state()
         
 record_thread = None
 transcribe_thread = None
 
+# ---------- 釋放 / 按鈕開關 ----------
+def update_unload_button_state():
+    """
+    根據模型是否已載入來開關 手動卸載 按鈕
+    """
+    if voice_models_loaded or (paddleocr_model is not None):
+        unload_btn.config(state="normal")
+    else:
+        unload_btn.config(state="disabled")
+
+def unload_models():
+    """
+    釋放 Whisper / Demucs 與 PaddleOCR 佔用的資源
+    """
+    global hf_model, hf_processor, stt_pipe, demucs_model, voice_models_loaded
+    global paddleocr_model
+
+    # Whisper / Demucs
+    if voice_models_loaded:
+        for _var in ("hf_model", "hf_processor", "stt_pipe", "demucs_model"):
+            if _var in globals():
+                del globals()[_var]
+        torch.cuda.empty_cache()
+        voice_models_loaded = False
+
+    # PaddleOCR
+    if paddleocr_model is not None:
+        del paddleocr_model
+        paddleocr_model = None
+
+    gc.collect()
+    update_unload_button_state()
+
 # -----------------------------------------------------
 # 1. 載入 Qwen2.5 翻譯模型
 # -----------------------------------------------------
-qwen_gguf_path = "./sakura-7b-qwen2.5-v1.0-q6k.gguf"
-
 print("使用 llama-cpp-python 加載 Qwen2.5 GGUF 模型中，請稍候...")
 llm = Llama(
     model_path=qwen_gguf_path,
@@ -210,7 +247,6 @@ def load_voice_models():
         return
     print("開始載入語音模型...")
     # 載入 Whisper STT 模型
-    hf_whisper_path = "./turbo"
     device_idx = 0 if torch.cuda.is_available() else -1
     torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
     hf_model = AutoModelForSpeechSeq2Seq.from_pretrained(
@@ -237,6 +273,7 @@ def load_voice_models():
     demucs_model.eval()
     print("Demucs 模型載入完成。")
     voice_models_loaded = True
+    update_unload_button_state()
 
 # -----------------------------------------------------
 # 3. 其餘參數 & GUI
@@ -248,7 +285,7 @@ RATE = 16000  #16kHz
 CHUNK_DURATION_MS = 30
 CHUNK_SIZE = int(RATE * CHUNK_DURATION_MS / 1000)   # 480
 VAD_SENSITIVITY = 1
-RMS_THRESHOLD = 400    # 音量閾值
+#RMS_THRESHOLD = 400    # 已改用可選音量閾值
 MAX_SILENCE_CHUNKS = 5 # 若連續5個chunk無聲 => 結束錄音
 
 RECORD_SECONDS_LIMIT = 10  # 最長錄幾秒避免拖太長
@@ -290,7 +327,7 @@ transcribe_flag = threading.Event()
 #=================================
 root = tk.Tk()
 root.title("即時字幕")
-root.geometry("600x900")
+root.geometry("600x950")
 
 gui_text = ScrolledText(root, wrap=tk.WORD, font=("Arial", 12))
 gui_text.pack(expand=True, fill='both')
@@ -377,6 +414,29 @@ def on_mode_change(event):
 
 mode_menu.bind("<<ComboboxSelected>>", on_mode_change)
 
+#=================================
+# 第 4 行：卸載 + 音量閾值
+#=================================
+control_frame = tk.Frame(root)
+control_frame.pack(pady=10)
+unload_btn = ttk.Button(control_frame,
+                        text="手動卸載STT/OCR",
+                        command=unload_models,
+                        state="disabled")          # 預設不可按
+unload_btn.pack(side="left", padx=4)
+
+threshold_label = tk.Label(control_frame, text="音量閾值:")
+threshold_label.pack(side=tk.LEFT, padx=5)
+
+rms_threshold_var = tk.StringVar(value="400")           # 預設 400
+threshold_menu = ttk.Combobox(
+    control_frame,
+    textvariable=rms_threshold_var,
+    values=[str(i) for i in range(100, 1001, 100)],     # 100,200,…,1000
+    state="readonly",
+    width=5
+)
+threshold_menu.pack(side=tk.LEFT, padx=5)
 # =========== Demucs 模組 ===========
 def compute_rms(data_bytes: bytes) -> float:
     data_i16 = np.frombuffer(data_bytes, dtype=np.int16).astype(np.float32)
@@ -422,6 +482,7 @@ def record_audio():
     2) 在 'recording' 狀態，用 webrtcvad 判斷是否 speech => 有 => 累積, 無 => 結束
     3) 結束後，將錄音數據推送到 processing_queue
     """
+    global vocal
     gui_queue.put(f"[{datetime.now().strftime('%H:%M:%S')}] 開始錄音(音量閾值+VAD)...\n")
 
     while not transcribe_flag.is_set():
@@ -432,12 +493,14 @@ def record_audio():
             continue
 
         # Step A: 若音量低於閾值 => 不錄
+        current_threshold = int(rms_threshold_var.get())
+        vocal = current_threshold/2
         rms_val = compute_rms(chunk)
-        if rms_val < RMS_THRESHOLD:
+        if rms_val < current_threshold:
             continue
 
         # ========== 一旦音量>=閾值 => 進入'錄音'狀態 ==========
-        gui_queue.put(f"[{datetime.now().strftime('%H:%M:%S')}] 音量{rms_val:.0f}>=閾值 {RMS_THRESHOLD},開始錄...\n")
+        gui_queue.put(f"[{datetime.now().strftime('%H:%M:%S')}] 音量{rms_val:.0f}>=閾值 {current_threshold},開始錄...\n")
 
         recorded_frames = []
         silence_count = 0
@@ -508,7 +571,7 @@ def transcribe_audio():
 
             # 2) 計算分離後音量
             rms_val = compute_rms(vocals_int16)
-            if rms_val < 200:     # 確認分離後有聲音才傳給whisper
+            if rms_val < vocal:     # 確認分離後有聲音才傳給whisper
                 gui_queue.put(f"無人聲跳過\n")
                 continue
 
@@ -874,6 +937,7 @@ def update_gui():
             gui_text.see(tk.END)  # 確保每次插入後都滾動
         except queue.Empty:
             pass
+    update_unload_button_state() 
     root.after(100, update_gui)  # 每100ms檢查一次
 
 def start_transcription():
@@ -926,7 +990,6 @@ stop_button = tk.Button(
     width=15, bg='red', fg='white', state=tk.DISABLED
 )
 stop_button.pack(side=tk.LEFT, padx=10)
-
 # ========== 讀寫記憶 ==========
 
 def load_short_term_memory():
