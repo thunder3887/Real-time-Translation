@@ -30,6 +30,7 @@ from llama_cpp import Llama
 qwen_gguf_path = "./sakura-7b-qwen2.5-v1.0-q6k.gguf"    # Qwen2.5 GGUF 模型路徑
 hf_whisper_path = "./turbo"                             # Whisper large-turbo 模型路徑
 
+os.environ["OMP_NUM_THREADS"] = "1"
 # ---------- 視窗固定 ----------
 import ctypes
 try:
@@ -47,14 +48,18 @@ current_mode = MODE_VOICE  # 默認語音轉錄
 voice_models_loaded = False
 
 paddleocr_model = None  # 全局變量
-persistent_window = None  # 全局變量，記錄持久OCR窗口對象
+paddleocr_lang = None
+persistent_window = None  # 記錄持久OCR窗口對象
 persistent_ocr_active = False  # 標記是否正在進行持續OCR
-def load_paddleocr():
-    global paddleocr_model
-    if paddleocr_model is None:
-        from paddleocr import PaddleOCR
-        # 根據需要調整 lang 參數，如 "japan", "en", "ch" 等
-        paddleocr_model = PaddleOCR(use_angle_cls=True, lang="japan")
+ocr_help_shown = False
+def load_paddleocr(lang="japan"):
+    global paddleocr_model, paddleocr_lang
+    from paddleocr import PaddleOCR
+    need_init = (paddleocr_model is None) or (paddleocr_lang != lang)
+    if need_init:
+        first_time = (paddleocr_model is None)
+        paddleocr_model = PaddleOCR(use_angle_cls=True, lang=lang)
+        paddleocr_lang = lang
         update_unload_button_state()
         
 record_thread = None
@@ -79,16 +84,29 @@ def unload_models():
 
     # Whisper / Demucs
     if voice_models_loaded:
+        try:
+            if 'demucs_model' in globals() and demucs_model is not None:
+                for submodel in demucs_model.models:
+                    submodel.to("cpu")
+        except Exception:
+            pass
         for _var in ("hf_model", "hf_processor", "stt_pipe", "demucs_model"):
             if _var in globals():
-                del globals()[_var]
-        torch.cuda.empty_cache()
+                globals()[_var] = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         voice_models_loaded = False
 
     # PaddleOCR
     if paddleocr_model is not None:
         del paddleocr_model
         paddleocr_model = None
+    try:
+        globals()["paddleocr_lang"] = None
+        globals()["ocr_help_shown"] = False
+    except Exception:
+        pass
 
     gc.collect()
     update_unload_button_state()
@@ -230,8 +248,9 @@ def trim_excess_rounds(memory_data):
     system_part = memory_data[0]
     conv_part = memory_data[1:]  # user/assistant pairs
     rounds = len(conv_part)//2
-    if rounds > MAX_HISTORY_ROUNDS:
-        conv_part = conv_part[2:]
+    while rounds > MAX_HISTORY_ROUNDS:
+        conv_part = conv_part[2:]  # 砍最舊的一組 (user+assistant)
+        rounds = len(conv_part)//2
     return [system_part] + conv_part
 
 # -----------------------------------------------------
@@ -254,6 +273,8 @@ def load_voice_models():
         torch_dtype=torch_dtype,
         local_files_only=True
     )
+    # 強制 decoder 提示清空，避免與 language= 衝突
+    hf_model.config.forced_decoder_ids = None
     hf_processor = AutoProcessor.from_pretrained(hf_whisper_path, local_files_only=True)
     stt_pipe = pipeline(
         task="automatic-speech-recognition",
@@ -290,31 +311,52 @@ MAX_SILENCE_CHUNKS = 5 # 若連續5個chunk無聲 => 結束錄音
 
 RECORD_SECONDS_LIMIT = 10  # 最長錄幾秒避免拖太長
 
-audio = pyaudio.PyAudio()
-virtual_device_name = "CABLE Output"   #耳機輸出
-device_index = None
-for i in range(audio.get_device_count()):
-    devinfo = audio.get_device_info_by_index(i)
-    if virtual_device_name.lower() in devinfo['name'].lower():
-        device_index = i
-        break
+audio = None
+stream = None
+virtual_device_name = "CABLE Output"  # 耳機輸出
 
-if device_index is None:
-    print(f"未找到音頻裝置: {virtual_device_name}")
-    exit(1)
+def open_audio_stream():
+    global audio, stream
+    if audio is not None and stream is not None:
+        return
+    audio = pyaudio.PyAudio()
+    device_index = None
+    for i in range(audio.get_device_count()):
+        devinfo = audio.get_device_info_by_index(i)
+        if virtual_device_name.lower() in devinfo['name'].lower():
+            device_index = i
+            break
+    if device_index is None:
+        print(f"未找到音頻裝置: {virtual_device_name}")
+        return  # 不 exit，讓 GUI 還能用 OCR
+    try:
+        stream = audio.open(
+            format=FORMAT,
+            channels=CHANNELS,
+            rate=RATE,
+            input=True,
+            frames_per_buffer=CHUNK_SIZE,
+            input_device_index=device_index
+        )
+    except Exception as e:
+        print(f"無法打開音頻流: {e}")
+        stream = None
 
-try:
-    stream = audio.open(
-        format=FORMAT,
-        channels=CHANNELS,
-        rate=RATE,
-        input=True,
-        frames_per_buffer=CHUNK_SIZE,
-        input_device_index=device_index
-    )
-except Exception as e:
-    print(f"無法打開音頻流: {e}")
-    exit(1)
+def close_audio_stream():
+    global audio, stream
+    try:
+        if stream is not None:
+            stream.stop_stream()
+            stream.close()
+    except Exception:
+        pass
+    try:
+        if audio is not None:
+            audio.terminate()
+    except Exception:
+        pass
+    stream = None
+    audio = None
 
 # 定義兩個隊列：一個用於錄音線程到處理線程，另一個用於處理線程到GUI
 processing_queue = queue.Queue()
@@ -482,7 +524,6 @@ def record_audio():
     2) 在 'recording' 狀態，用 webrtcvad 判斷是否 speech => 有 => 累積, 無 => 結束
     3) 結束後，將錄音數據推送到 processing_queue
     """
-    global vocal
     gui_queue.put(f"[{datetime.now().strftime('%H:%M:%S')}] 開始錄音(音量閾值+VAD)...\n")
 
     while not transcribe_flag.is_set():
@@ -494,7 +535,6 @@ def record_audio():
 
         # Step A: 若音量低於閾值 => 不錄
         current_threshold = int(rms_threshold_var.get())
-        vocal = current_threshold/2
         rms_val = compute_rms(chunk)
         if rms_val < current_threshold:
             continue
@@ -570,9 +610,10 @@ def transcribe_audio():
             vocals_int16 = demucs_vocals(raw_data_bytes)
 
             # 2) 計算分離後音量
+            post_vocal_threshold = int(rms_threshold_var.get()) * 0.5
             rms_val = compute_rms(vocals_int16)
-            if rms_val < vocal:     # 確認分離後有聲音才傳給whisper
-                gui_queue.put(f"無人聲跳過\n")
+            if rms_val < post_vocal_threshold:
+                gui_queue.put("無人聲跳過\n")
                 continue
 
             # 3) Whisper STT
@@ -607,7 +648,7 @@ def select_region():
     並調用 PaddleOCR 進行 OCR，再將 OCR 原文和 LLM 翻譯結果顯示到 GUI。
     """
     import pyautogui
-
+    show_ocr_help_once(clear=True)
     class SelectionWindow(tk.Toplevel):
         def __init__(self, master):
             super().__init__(master)
@@ -710,26 +751,29 @@ def select_region():
         return  # 用戶未確認
     x, y, width, height = sel_win.selected_geom
     screenshot = pyautogui.screenshot(region=(x, y, width, height))
-    # 將截圖傳給 PaddleOCR
-    temp_file = "temp_ocr.png"
-    screenshot.save(temp_file)
     # OCR處理
-    from paddleocr import PaddleOCR
     # 根據用戶選擇語言，可動態調整 PaddleOCR 的 lang 參數，例如：若 language_var.get() == "english"，則 lang="en"
-    if language_var.get() in ["japanese"]:
+    lang_sel = language_var.get()
+    if lang_sel == "japanese":
         ocr_lang = "japan"
-    if language_var.get() in ["english"]:
+    elif lang_sel == "english":
         ocr_lang = "en"
-    if language_var.get() in ["chinese"]:
+    elif lang_sel == "chinese":
         ocr_lang = "ch"
-    ocr = PaddleOCR(use_angle_cls=True, lang=ocr_lang)
-    result = ocr.ocr(temp_file, cls=True)
+    else:
+        ocr_lang = "japan"
+
+    global paddleocr_model, paddleocr_lang
+    load_paddleocr(ocr_lang)
+
+    # 直接丟 ndarray，省去存檔 I/O
+    img_np = np.array(screenshot)              # PIL → ndarray(RGB)
+    result = paddleocr_model.ocr(img_np, cls=True)
     ocr_text = ""
     for line in result:
         ocr_text += " ".join([w[1][0] for w in line]) + "\n"
     if not ocr_text.strip():
         gui_queue.put("OCR 為空，跳過翻譯\n")
-        os.remove(temp_file)
         return
     # 顯示 OCR 原文
     gui_queue.put((f"[{datetime.now().strftime('%H:%M:%S')}] OCR 原文:\n{ocr_text}\n", "ja_color"))
@@ -739,8 +783,7 @@ def select_region():
         translated = gguf_translate_text_to_chinese(ocr_text)
     else:
         translated = gguf_translate_text_direct(ocr_text)
-    gui_queue.put((f"[{datetime.now().strftime('%H:%M:%S')}] 翻譯結果:\n{translated}\n", "zh_color"))
-    os.remove(temp_file)
+    gui_queue.put((f"[{datetime.now().strftime('%H:%M:%S')}] 翻譯結果:\n{translated}\n", "zh_color"))    
 
 class PersistentRegionWindow(tk.Toplevel):  # 持續存在的視窗
     def __init__(self, master):
@@ -838,29 +881,31 @@ def periodic_ocr():
     若 persistent_ocr_active 為 True，則每隔 X 秒自動截取 persistent_window 範圍做OCR
     """
     global persistent_window, persistent_ocr_active
+    show_ocr_help_once(clear=True)
     if not persistent_ocr_active or not persistent_window:
         return  # 已停止或窗口不存在
     # 取得當前幾何
     x, y, w, h = persistent_window.get_region()
     import pyautogui
     screenshot = pyautogui.screenshot(region=(x, y, w, h))
-    temp_file = "temp_ocr.png"
-    screenshot.save(temp_file)
 
     # 動態設置語言
-    if language_var.get() == "japanese":
+    lang_sel = language_var.get()
+    if lang_sel == "japanese":
         ocr_lang = "japan"
-    elif language_var.get() == "english":
+    elif lang_sel == "english":
         ocr_lang = "en"
-    elif language_var.get() == "chinese":
+    elif lang_sel == "chinese":
         ocr_lang = "ch"
-    if paddleocr_model is None:
-        load_paddleocr()
-    result = paddleocr_model.ocr(temp_file, cls=True)
+    else:
+        ocr_lang = "japan"
+
+    load_paddleocr(ocr_lang)
+    img_np = np.array(screenshot)
+    result = paddleocr_model.ocr(img_np, cls=True)
     ocr_text = ""
     for line in result:
         ocr_text += " ".join([w[1][0] for w in line]) + "\n"
-    os.remove(temp_file)
     
     # 如果無內容 => 直接跳過
     if not ocr_text.strip():
@@ -908,6 +953,7 @@ def toggle_persistent_ocr():
         # 未啟動 => 創建窗口
         persistent_ocr_active = True
         persistent_window = PersistentRegionWindow(root)
+        show_ocr_help_once(clear=True)
         gui_queue.put(f"[{datetime.now().strftime('%H:%M:%S')}] 5秒後開始持續辨識...\n")
         # 5秒後開始
         root.after(5000, start_persistent_ocr)
@@ -928,6 +974,10 @@ def update_gui():
     while not gui_queue.empty():
         try:
             msg = gui_queue.get_nowait()
+
+            if msg == "__CLEAR__":
+                gui_text.delete(1.0, tk.END)
+                continue
             if isinstance(msg, tuple) and len(msg) == 2:
                 # 用於標色顯示
                 text, tag = msg
@@ -940,12 +990,32 @@ def update_gui():
     update_unload_button_state() 
     root.after(100, update_gui)  # 每100ms檢查一次
 
+def show_ocr_help_once(clear=True):
+    """第一次顯示 OCR 說明；之後不再顯示。"""
+    global ocr_help_shown
+    if not ocr_help_shown:
+        if clear:
+            gui_queue.put("__CLEAR__")  # 先清空 GUI
+        gui_queue.put(
+            f"[{datetime.now().strftime('%H:%M:%S')}] OCR 模式啟動\n"
+            "請點擊 '選取區域' 按鈕進行單次辨識\n"
+            "'持續辨識' 按鈕進持續辨識\n"
+            "右鍵拖拽可改區域大小\n"
+            "左鍵拖拽可移動\n"
+        )
+        ocr_help_shown = True
+
 def start_transcription():
     global record_thread, transcribe_thread, voice_models_loaded
     transcribe_flag.clear()
     gui_text.delete(1.0, tk.END)
     current_mode = mode_var.get()
     if current_mode == MODE_VOICE:
+        # 僅語音模式才開音訊流
+        open_audio_stream()
+        if stream is None:
+            gui_queue.put("音訊裝置開啟失敗，請確認裝置或名稱。\n")
+            return
         # 動態加載語音相關模型（Whisper、Demucs）只在首次選擇時加載
         if not voice_models_loaded:
             load_voice_models()  # 載入
@@ -955,9 +1025,28 @@ def start_transcription():
         transcribe_thread.start()
         gui_queue.put(f"[{datetime.now().strftime('%H:%M:%S')}] 語音轉錄模式啟動。\n")
     else:
-        # OCR 模式：延遲加載 PaddleOCR 模型
-        load_paddleocr()
-        gui_queue.put(f"[{datetime.now().strftime('%H:%M:%S')}] OCR 模式啟動\n請點擊 '選取區域' 按鈕進行單次辨識\n'持續辨識' 按鈕進持續辨識\n右鍵拖拽可改區域大小\n左鍵拖拽可移動\n")
+        # 根據下拉選單決定 OCR 語言
+        lang_sel = language_var.get()
+        if lang_sel == "japanese":
+            ocr_lang = "japan"
+        elif lang_sel == "english":
+            ocr_lang = "en"
+        elif lang_sel == "chinese":
+            ocr_lang = "ch"
+        else:
+            ocr_lang = "japan"
+
+        load_paddleocr(ocr_lang)
+        global ocr_help_shown
+        if not ocr_help_shown:
+            gui_queue.put(
+                f"[{datetime.now().strftime('%H:%M:%S')}] OCR 模式啟動\n"
+                "請點擊 '選取區域' 按鈕進行單次辨識\n"
+                "'持續辨識' 按鈕進持續辨識\n"
+                "右鍵拖拽可改區域大小\n"
+                "左鍵拖拽可移動\n"
+            )
+            ocr_help_shown = True
     start_button.config(state=tk.DISABLED)
     stop_button.config(state=tk.NORMAL)
 
@@ -975,6 +1064,7 @@ def stop_transcription():
     transcribe_flag.set()
     # 不需推送 None 給 processing_queue，處理線程會根據 flag 結束
     check_threads_end()
+    close_audio_stream()
 
 button_frame = tk.Frame(root)
 button_frame.pack(pady=10)
@@ -1040,9 +1130,14 @@ def save_short_term_memory(memory_data):
 
 def on_close():
     global record_thread, transcribe_thread
-    # 若 record_thread 為 None 或未啟動，就不做任何動作
-    if record_thread is not None and record_thread.is_alive():
-        transcribe_flag.set()
+    transcribe_flag.set()
+    for t in (record_thread, transcribe_thread):
+        try:
+            if t is not None and t.is_alive():
+                t.join(timeout=1.5)
+        except Exception:
+            pass
+    close_audio_stream()
     root.destroy()
 
 root.protocol("WM_DELETE_WINDOW", on_close)
