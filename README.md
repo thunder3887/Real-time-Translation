@@ -1,5 +1,5 @@
 # Real-time-Translation
-基於whisper-large、PaddleOCR、Sakura-Qwen2.5的即時翻譯
+基於whisper-large、PaddleOCR、Sakura-Qwen2.5的即時翻譯和漫畫翻譯嵌字
 
 前期準備:
 
