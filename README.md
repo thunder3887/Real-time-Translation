@@ -17,7 +17,7 @@
 ## whisper和Sakura-Qwen2.5本地路徑自行更改，模型大小依照顯存自行決定
 建議whisper-large-turbo或以上，建議Sakura-Qwen2.5 7B-Q4或以上
 
-## 上傳圖片的模式下也可以用ollama運行VLM替代OCR
+## (可選)上傳圖片的模式下也可以用ollama運行VLM替代OCR
 普通模式下文字背景沒漫畫那麼雜的話OCR完全夠用，所以只做上傳圖片的時候可替代，運行VLM替代OCR建議qwen2.5vl:7b-q4_K_M或以上
 
 ## GUI
