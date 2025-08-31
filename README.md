@@ -13,7 +13,7 @@
 
 同時運行sakura-7b-qwen2.5-q6k、qwen2.5vl:7b-q4_K_M需10G顯存
 
-[SakuraLLM]([https://huggingface.co/SakuraLLM])
+[SakuraLLM](https://huggingface.co/SakuraLLM)
 ## whisper和Sakura-Qwen2.5本地路徑自行更改，模型大小依照顯存自行決定
 建議whisper-large-turbo或以上，建議Sakura-Qwen2.5 7B-Q4或以上
 
