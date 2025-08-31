@@ -21,8 +21,8 @@
 普通模式下文字背景沒漫畫那麼雜的話OCR完全夠用，所以只做上傳圖片的時候可替代，運行VLM替代OCR建議qwen2.5vl:7b-q4_K_M或以上
 
 ## GUI
-![示意圖](example.png)
+<img src="example.png" width="300"/>
 
-| <img src="1-1.png" width="200"/> | <img src="1-2.png" width="200"/> | <img src="1-3" width="200"/> |
+| <img src="1-1.png" width="200"/> | <img src="1-2.png" width="200"/> | <img src="1-3.png" width="200"/> |
 
 | <img src="2-1.png" width="200"/> | <img src="2-2.png" width="200"/> | <img src="2-3.png" width="200"/> |
