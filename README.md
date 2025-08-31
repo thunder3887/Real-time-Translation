@@ -23,6 +23,6 @@
 ## GUI
 ![示意圖](example.png)
 
-| ![left](1-1.png) | ![center](1-2.png) | ![right](1-3.png) |
+| <img src="1-1.png" width="200"/> | <img src="1-2.png" width="200"/> | <img src="1-3" width="200"/> |
 
-| ![left](2-1.png) | ![center](2-2.png) | ![right](2-3.png) |
+| <img src="2-1.png" width="200"/> | <img src="2-2.png" width="200"/> | <img src="2-3.png" width="200"/> |
