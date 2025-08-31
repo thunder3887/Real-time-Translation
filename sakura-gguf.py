@@ -8,11 +8,17 @@ from datetime import datetime
 import tkinter as tk
 from tkinter.scrolledtext import ScrolledText
 from tkinter import ttk
+from tkinter import filedialog
 import json
 import os
 import resampy
 import soundfile as sf
 import gc
+from PIL import Image, ImageDraw, ImageFont
+import textwrap
+import cv2
+import numpy as np
+import requests, base64
 
 import webrtcvad
 
@@ -27,10 +33,14 @@ from transformers import (
 
 from llama_cpp import Llama
 
-qwen_gguf_path = "./sakura-7b-qwen2.5-v1.0-q6k.gguf"    # Qwen2.5 GGUF 模型路徑
+qwen_gguf_path = "./sakura-7b-qwen2.5-v1.0-q6k.gguf"    # sakura GGUF 模型路徑
 hf_whisper_path = "./turbo"                             # Whisper large-turbo 模型路徑
+OLLAMA_URL = "http://localhost:11434/api/chat"
+OLLAMA_MODEL = "qwen2.5vl:7b-q4_K_M"                    # ollama模型名稱 qwen2.5vl:3b-q4_K_M or qwen2.5vl:7b-q4_K_M
 
 os.environ["OMP_NUM_THREADS"] = "1"
+SAVE_DIR = os.path.join(os.path.dirname(__file__), "translated_outputs")
+os.makedirs(SAVE_DIR, exist_ok=True)
 # ---------- 視窗固定 ----------
 import ctypes
 try:
@@ -46,6 +56,8 @@ current_mode = MODE_VOICE  # 默認語音轉錄
 
 # 標記是否已加載語音相關模型（初始只加載 LLM）
 voice_models_loaded = False
+
+vlm_active = False   # 勾選並且啟動過 VLM 流程後設為 True
 
 paddleocr_model = None  # 全局變量
 paddleocr_lang = None
@@ -70,7 +82,11 @@ def update_unload_button_state():
     """
     根據模型是否已載入來開關 手動卸載 按鈕
     """
-    if voice_models_loaded or (paddleocr_model is not None):
+    has_stt = bool(voice_models_loaded)
+    has_ocr = (paddleocr_model is not None)
+    has_vlm = bool(vlm_active)
+
+    if has_stt or has_ocr or has_vlm:
         unload_btn.config(state="normal")
     else:
         unload_btn.config(state="disabled")
@@ -81,7 +97,7 @@ def unload_models():
     """
     global hf_model, hf_processor, stt_pipe, demucs_model, voice_models_loaded
     global paddleocr_model
-
+    global vlm_active
     # Whisper / Demucs
     if voice_models_loaded:
         try:
@@ -97,7 +113,6 @@ def unload_models():
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         voice_models_loaded = False
-
     # PaddleOCR
     if paddleocr_model is not None:
         del paddleocr_model
@@ -107,14 +122,25 @@ def unload_models():
         globals()["ocr_help_shown"] = False
     except Exception:
         pass
+    # VLM
+    if vlm_active:
+        try:
+            import subprocess, shutil
+            if shutil.which("ollama"):
+                subprocess.run(["ollama", "stop", OLLAMA_MODEL],
+                                timeout=4, check=False)
+        except Exception:
+            pass
+        finally:
+            vlm_active = False
 
     gc.collect()
     update_unload_button_state()
 
 # -----------------------------------------------------
-# 1. 載入 Qwen2.5 翻譯模型
+# 1. 載入 sakura 翻譯模型
 # -----------------------------------------------------
-print("使用 llama-cpp-python 加載 Qwen2.5 GGUF 模型中，請稍候...")
+print("使用加載 sakura GGUF 模型中，請稍候...")
 llm = Llama(
     model_path=qwen_gguf_path,
     n_ctx=4096,           # 上下文長度
@@ -124,7 +150,7 @@ llm = Llama(
     n_gpu_layers=30,      # 看模型大小去測試
     f16_kv=True,          
 )
-print("GGUF Qwen2.5 模型載入完畢。")
+print("GGUF sakura 模型載入完畢。")
 
 JSON_MEMORY_FILE = "short_term_memory.json"  # 存對話記憶的 JSON
 MAX_HISTORY_ROUNDS = 5  # 只保留 5 組對話
@@ -138,7 +164,7 @@ if os.path.exists(JSON_MEMORY_FILE):
 
 def gguf_translate_text_to_chinese(text: str) -> str:
     """
-    使用短期記憶 (JSON) + llama-cpp (GGUF Qwen2.5)
+    使用短期記憶 (JSON) + llama-cpp (GGUF sakura)
     """
     # 1) 載入 memory
     memory_data = load_short_term_memory()
@@ -179,10 +205,9 @@ def gguf_translate_text_to_chinese(text: str) -> str:
 
     return assistant_text
 
-
 def gguf_translate_text_direct(text: str) -> str:
     """
-    不使用記憶，單純呼叫 llama-cpp (GGUF Qwen2.5).
+    不使用記憶，單純呼叫 llama-cpp (GGUF sakura).
     """
     # -------------------------------
     # Prompt 寫法
@@ -198,7 +223,6 @@ def gguf_translate_text_direct(text: str) -> str:
         "<|im_start|>assistant\n"
     )
 
-    # 仍然呼叫 llm() 做推理，stop 標記可以暫時維持不變
     res = llm(
         prompt=prompt_str,
         max_tokens=128,
@@ -369,7 +393,7 @@ transcribe_flag = threading.Event()
 #=================================
 root = tk.Tk()
 root.title("即時字幕")
-root.geometry("600x950")
+root.geometry("600x1020")
 
 gui_text = ScrolledText(root, wrap=tk.WORD, font=("Arial", 12))
 gui_text.pack(expand=True, fill='both')
@@ -395,7 +419,6 @@ language_menu = ttk.Combobox(
 )
 language_menu.pack(side=tk.LEFT, padx=5)
 
-
 #=================================
 # 第 2 行：模式選擇 + “使用上下文記憶”
 #=================================
@@ -415,10 +438,9 @@ mode_menu = ttk.Combobox(
 )
 mode_menu.pack(side=tk.LEFT, padx=5)
 
-context_var = tk.BooleanVar(value=True)
+context_var = tk.BooleanVar(value=False)
 context_check = tk.Checkbutton(mode_context_frame, text="使用上下文記憶", variable=context_var)
 context_check.pack(side=tk.LEFT, padx=5)
-
 
 #=================================
 # 第 3 行：選取區域 + 持續辨識 + 間隔
@@ -462,7 +484,7 @@ mode_menu.bind("<<ComboboxSelected>>", on_mode_change)
 control_frame = tk.Frame(root)
 control_frame.pack(pady=10)
 unload_btn = ttk.Button(control_frame,
-                        text="手動卸載STT/OCR",
+                        text="手動卸載STT/OCR/VLM",
                         command=unload_models,
                         state="disabled")          # 預設不可按
 unload_btn.pack(side="left", padx=4)
@@ -479,6 +501,32 @@ threshold_menu = ttk.Combobox(
     width=5
 )
 threshold_menu.pack(side=tk.LEFT, padx=5)
+#=================================
+# 第 5 行：文字排版方向
+#=================================
+orientation_frame = tk.Frame(root)
+orientation_frame.pack(pady=10)
+
+orientation_label = tk.Label(orientation_frame, text="上傳圖片的文字方向:")
+orientation_label.pack(side=tk.LEFT, padx=5)
+
+orientation_var = tk.StringVar(value="vertical")  # 預設「由上到下再由右到左」
+
+orientation_menu = ttk.Combobox(
+    orientation_frame,
+    textvariable=orientation_var,
+    values=["vertical (由上到下再由右到左)", "horizontal (由左到右再由上到下)"],
+    state="readonly",
+    width=30
+)
+orientation_menu.pack(side=tk.LEFT, padx=5)
+#=================================
+# 第 6 行：VLM模型辨識
+#=================================
+use_ollama_var = tk.BooleanVar(value=False)
+chk_ollama = tk.Checkbutton(root, text="使用ollama運行VLM模型辨識圖片文字", variable=use_ollama_var)
+chk_ollama.pack(anchor="w", padx=10, pady=2)
+
 # =========== Demucs 模組 ===========
 def compute_rms(data_bytes: bytes) -> float:
     data_i16 = np.frombuffer(data_bytes, dtype=np.int16).astype(np.float32)
@@ -515,7 +563,6 @@ def demucs_vocals(audio_bytes: bytes) -> bytes:
     down_np = resampy.resample(vocals_mono, sr_out, RATE)
     vocals_i16 = (down_np * 32768.0).clip(-32768,32767).astype(np.int16).tobytes()
     return vocals_i16
-
 
 def record_audio():
     """
@@ -584,7 +631,6 @@ def record_audio():
 
     # 結束 => 不需推送 None，因為處理線程會持續等待
     gui_queue.put(f"[{datetime.now().strftime('%H:%M:%S')}] 停止錄製(音量閾值+VAD)...\n")
-
 
 def transcribe_audio():
     """
@@ -766,7 +812,6 @@ def select_region():
     global paddleocr_model, paddleocr_lang
     load_paddleocr(ocr_lang)
 
-    # 直接丟 ndarray，省去存檔 I/O
     img_np = np.array(screenshot)              # PIL → ndarray(RGB)
     result = paddleocr_model.ocr(img_np, cls=True)
     ocr_text = ""
@@ -778,7 +823,6 @@ def select_region():
     # 顯示 OCR 原文
     gui_queue.put((f"[{datetime.now().strftime('%H:%M:%S')}] OCR 原文:\n{ocr_text}\n", "ja_color"))
     # 翻譯 OCR 結果（可選擇使用上下文記憶）
-    # 翻譯 OCR 結果
     if context_var.get():
         translated = gguf_translate_text_to_chinese(ocr_text)
     else:
@@ -927,7 +971,6 @@ def periodic_ocr():
         translated = gguf_translate_text_direct(ocr_text)
     gui_queue.put((f"[{datetime.now().strftime('%H:%M:%S')}] 翻譯結果:\n{translated}\n", "zh_color"))
 
-    # 再次調度下次OCR
     # 讀取下拉選單間隔
     try:
         interval_sec = int(interval_var.get())
@@ -1050,6 +1093,872 @@ def start_transcription():
     start_button.config(state=tk.DISABLED)
     stop_button.config(state=tk.NORMAL)
 
+# -------------- 辨識圖片小工具 --------------
+def put_log(msg, tag=None):
+    try:
+        if tag:
+            gui_queue.put((msg, tag))
+        else:
+            gui_queue.put(msg)
+    except Exception:
+        pass
+
+def get_font(px):
+    try:
+        return ImageFont.truetype("NotoSansCJK-Bold.otf", px)
+    except Exception:
+        try:
+            return ImageFont.truetype("msyh.ttc", px)
+        except Exception:
+            return ImageFont.load_default()
+
+def draw_text_with_stroke(draw, xy, text, font,
+                            fill=(255, 255, 255),
+                            stroke_fill=(0, 0, 0),
+                            stroke_width=2):
+    x, y = xy
+    for dx in (-stroke_width, 0, stroke_width):
+        for dy in (-stroke_width, 0, stroke_width):
+            if dx == 0 and dy == 0:
+                continue
+            draw.text((x + dx, y + dy), text, font=font, fill=stroke_fill)
+    draw.text((x, y), text, font=font, fill=fill)
+
+def measure_line(draw, text, font):
+    bb = draw.textbbox((0, 0), text, font=font)
+    return bb[2], bb[3]
+
+# === OCR 強化：先放大 → 多路增強（含反相）→ 分別跑 PaddleOCR → 擇優 ===
+def _resize_long_side(img_rgb, target_long=1536):
+    h, w = img_rgb.shape[:2]
+    long_side = max(h, w)
+    if long_side >= target_long:
+        return img_rgb
+    scale = target_long / float(long_side)
+    new_w, new_h = int(round(w * scale)), int(round(h * scale))
+    return cv2.resize(img_rgb, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+
+def _prep_variants(img_rgb):
+    base = img_rgb
+
+    # v0: 原圖
+    v0 = base
+
+    # v1: CLAHE on L channel
+    lab = cv2.cvtColor(base, cv2.COLOR_RGB2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l2 = clahe.apply(l)
+    v1 = cv2.cvtColor(cv2.merge([l2, a, b]), cv2.COLOR_LAB2RGB)
+
+    # v2: 自適應二值（白底黑字）
+    gray = cv2.cvtColor(base, cv2.COLOR_RGB2GRAY)
+    v2g = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                cv2.THRESH_BINARY, 35, 10)
+    v2 = cv2.cvtColor(v2g, cv2.COLOR_GRAY2RGB)
+
+    # v3: 自適應二值 + 反相（黑底白字）
+    v3g = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                cv2.THRESH_BINARY_INV, 35, 10)
+    v3 = cv2.cvtColor(v3g, cv2.COLOR_GRAY2RGB)
+
+    # v4: 輕度銳化
+    blur = cv2.GaussianBlur(base, (0, 0), 1.0)
+    v4 = cv2.addWeighted(base, 1.5, blur, -0.5, 0)
+
+    # v5: 雙邊去噪 + CLAHE
+    bf = cv2.bilateralFilter(base, d=5, sigmaColor=50, sigmaSpace=50)
+    lab2 = cv2.cvtColor(bf, cv2.COLOR_RGB2LAB)
+    l, a, b = cv2.split(lab2)
+    l3 = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(l)
+    v5 = cv2.cvtColor(cv2.merge([l3, a, b]), cv2.COLOR_LAB2RGB)
+
+    # v6: 向左旋轉90度
+    v6 = cv2.rotate(base, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+    return [v0, v1, v2, v3, v4, v5, v6]
+
+def ocr_best_of_upscaled(img_rgb):
+    up = _resize_long_side(img_rgb, target_long=1536)
+    variants = _prep_variants(up)
+    best = (None, "", -1.0, -1)  # (lines, text, score, idx)
+
+    def _score_one(img_arr):
+        try:
+            res = paddleocr_model.ocr(img_arr, cls=True)
+        except Exception:
+            return None, "", 0.0
+        lines = res[0] if (res and isinstance(res[0], list)) else (res if isinstance(res, list) else [])
+        texts, scores = [], []
+        for ln in lines:
+            try:
+                t, s = ln[1][0], float(ln[1][1])
+            except Exception:
+                t, s = "", 0.0
+            if t:
+                texts.append(t)
+                scores.append(s)
+        if not texts:
+            return None, "", 0.0
+        avg = sum(scores) / len(scores)
+        return lines, " ".join(texts), avg
+
+    # 對 v1~v5 的製作（供 v6 二次處理使用）
+    def _prep_v1_v5_only(base):
+        out = []
+        # v1
+        lab = cv2.cvtColor(base, cv2.COLOR_RGB2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        l2 = clahe.apply(l)
+        out.append(cv2.cvtColor(cv2.merge([l2, a, b]), cv2.COLOR_LAB2RGB))
+        # v2
+        gray = cv2.cvtColor(base, cv2.COLOR_RGB2GRAY)
+        v2g = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                    cv2.THRESH_BINARY, 35, 10)
+        out.append(cv2.cvtColor(v2g, cv2.COLOR_GRAY2RGB))
+        # v3
+        v3g = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                    cv2.THRESH_BINARY_INV, 35, 10)
+        out.append(cv2.cvtColor(v3g, cv2.COLOR_GRAY2RGB))
+        # v4
+        blur = cv2.GaussianBlur(base, (0, 0), 1.0)
+        out.append(cv2.addWeighted(base, 1.5, blur, -0.5, 0))
+        # v5
+        bf = cv2.bilateralFilter(base, d=5, sigmaColor=50, sigmaSpace=50)
+        lab2 = cv2.cvtColor(bf, cv2.COLOR_RGB2LAB)
+        l, a, b = cv2.split(lab2)
+        l3 = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(l)
+        out.append(cv2.cvtColor(cv2.merge([l3, a, b]), cv2.COLOR_LAB2RGB))
+        return out
+
+    mode_str = orientation_var.get()
+    is_vertical = mode_str.startswith("vertical")
+    is_horizontal = mode_str.startswith("horizontal")
+
+    for idx, v in enumerate(variants):
+        lines, text, avg = _score_one(v)
+        if not lines:
+            continue
+        # 只針對 v6 做加/降權與二次處理
+        if idx == 6:
+            if is_vertical:
+                # 縱排 → 先 *1.5
+                avg *= 1.5
+
+                # 若加權後仍然 < 1.12 → 對 v6 的旋轉圖再做一次 v1~v5 增強與 OCR
+                if avg < 1.12:
+                    print("[OCR] v6 加權後仍 < 1.12，對旋轉後的圖再做 v1~v5 增強後重試")
+                    candidates = _prep_v1_v5_only(v)  # v 是 v6 圖（已旋轉）
+
+                    best2 = (None, "", 0.0)
+                    for vv in candidates:
+                        l2, t2, a2 = _score_one(vv)
+                        if a2 > best2[2]:
+                            best2 = (l2, t2, a2)
+
+                    # 若二次處理有結果，將其作為 v6 的最終結果（同樣套用 *1.5）
+                    if best2[0] is not None:
+                        lines, text, avg = best2[0], best2[1], best2[2] * 1.5
+                        print(f"[OCR] v6 二次處理生效，新的平均置信度(已加權)={avg:.3f}")
+                    else:
+                        print("[OCR] v6 二次處理沒有有效結果，沿用原本分數")
+
+            elif is_horizontal:
+                # 橫排 → 對 v6 降權
+                avg *= 0.7
+
+        # 更新全域最佳
+        if avg > best[2]:
+            best = (lines, text, avg, idx)
+
+    if best[3] >= 0:
+        print(f"[OCR] 最佳版本 v{best[3]} 平均置信度={best[2]:.3f}")
+    else:
+        print("[OCR] 沒有有效結果")
+
+    return best  # (best_lines, best_text, best_avg_score, best_index)
+
+# === 橫排排版（\n 先分段） ===
+def layout_horizontal(draw, text, box_w, box_h, min_font=10):
+    segments = text.split("\n") if "\n" in text else [text]
+    font_size = max(14, int(box_h * 0.72))
+    while font_size >= min_font:
+        font = get_font(font_size)
+        lines = []
+        for seg in segments:
+            cur = ""
+            for ch in seg:
+                w, _ = measure_line(draw, cur + ch, font)
+                if w <= max(1, box_w):
+                    cur += ch
+                else:
+                    if cur:
+                        lines.append(cur)
+                    cur = ch
+            if cur:
+                lines.append(cur)
+        line_h = max(1, measure_line(draw, "字", font)[1])
+        total_h = line_h * len(lines)
+        if total_h <= box_h or font_size == min_font:
+            return font, lines, line_h
+        font_size -= 1
+    font = get_font(min_font)
+    line_h = max(1, measure_line(draw, "字", font)[1])
+    return font, [text], line_h
+
+# === 直排排版（\n 當作換欄） ===
+def layout_vertical(draw, text, box_w, box_h, min_font=10):
+    segs = text.split("\n") if "\n" in text else [text]
+    font_size = max(14, int(box_w * 0.72))
+    while font_size >= min_font:
+        font = get_font(font_size)
+        col_w = max(1, measure_line(draw, "字", font)[0])
+        step_h = max(1, measure_line(draw, "字", font)[1])
+        max_per_col = max(1, box_h // step_h)
+
+        cols = []
+        for seg in segs:
+            i = 0
+            while i < len(seg):
+                cols.append(list(seg[i:i + max_per_col]))
+                i += max_per_col
+
+        cols.reverse()  # 改為右到左(把欄順序反轉)
+        total_w = col_w * max(1, len(cols))
+        if total_w <= box_w or font_size == min_font:
+            return font, cols, step_h, col_w
+        font_size -= 1
+
+    font = get_font(min_font)
+    col_w = max(1, measure_line(draw, "字", font)[0])
+    step_h = max(1, measure_line(draw, "字", font)[1])
+    return font, [list("".join(segs))], step_h, col_w
+
+def render_text_on_full(draw_full, box, text, vertical_mode):
+    """
+    最終回填到原圖。
+    """
+    x1, y1, x2, y2 = box
+    box_w = max(1, x2 - x1)
+    box_h = max(1, y2 - y1)
+
+    draw_full.rectangle([x1, y1, x2, y2], fill=(0, 0, 0))
+
+    if vertical_mode:
+        dummy = Image.new("RGB", (box_w, box_h), (0, 0, 0))
+        d = ImageDraw.Draw(dummy)
+        font, cols, step_h, col_w = layout_vertical(d, text, box_w, box_h)
+        total_w = col_w * len(cols)
+        total_h = step_h * (max(len(c) for c in cols) if cols else 1)
+        x0 = x1 + max(0, (box_w - total_w) // 2)
+        y0 = y1 + max(0, (box_h - total_h) // 2)
+        for ci, col in enumerate(cols):
+            cx = x0 + ci * col_w
+            cy = y0
+            for ch in col:
+                draw_text_with_stroke(draw_full, (cx, cy), ch, font,
+                                        fill=(255, 255, 255), stroke_fill=(0, 0, 0),
+                                        stroke_width=max(2, font.size // 12))
+                cy += step_h
+    else:
+        dummy = Image.new("RGB", (box_w, box_h), (0, 0, 0))
+        d = ImageDraw.Draw(dummy)
+        font, lines, line_h = layout_horizontal(d, text, box_w, box_h)
+        total_h = line_h * len(lines)
+        y0 = y1 + max(0, (box_h - total_h) // 2)
+        for i, ln in enumerate(lines):
+            w, _ = measure_line(d, ln, font)
+            x = x1 + max(0, (box_w - w) // 2)
+            y = y0 + i * line_h
+            draw_text_with_stroke(draw_full, (x, y), ln, font,
+                                    fill=(255, 255, 255), stroke_fill=(0, 0, 0),
+                                    stroke_width=max(2, font.size // 12))
+
+def infer_vertical_from_ocr_lines(lines):
+    """用 OCR 行框的寬高投票推斷方向；平手預設橫排(False)。"""
+    horiz = 0
+    vert = 0
+    for ln in lines:
+        try:
+            poly = np.array(ln[0], dtype=np.float32)
+            w = (np.linalg.norm(poly[0]-poly[1]) + np.linalg.norm(poly[2]-poly[3])) / 2.0
+            h = (np.linalg.norm(poly[1]-poly[2]) + np.linalg.norm(poly[3]-poly[0])) / 2.0
+            if w >= h * 1.1:
+                horiz += 1
+            elif h >= w * 1.1:
+                vert += 1
+        except Exception:
+            continue
+    return vert > horiz
+
+def build_text_mask_from_crop_auto(crop_rgb, dilate_px=3):
+    """
+    從整個裁切區域自動估計文字遮罩。
+    適合漫畫黑描邊白底/灰網點：自適應二值 + 邊緣 → 關閉/膨脹，並移除過大的連通元件避免整塊白框被抹掉。
+    回傳 0/255 單通道遮罩（白=要去除的筆劃）。
+    """
+    gray = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY)
+
+    # 自適應二值（反相：文字→白）
+    th_adpt = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV,
+        31, 15
+    )
+    # 邊緣
+    edges = cv2.Canny(gray, 60, 150)
+
+    # 合併兩種線索
+    mask = cv2.bitwise_or(th_adpt, edges)
+
+    # 收斂/膨脹，讓字描邊被完整覆蓋
+    if dilate_px > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_RECT, (dilate_px, dilate_px))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=1)
+
+    # 移除過大的 blob（避免把整個對話框邊框或大片白底一併抹掉）
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8, cv2.CV_32S)
+    h, w = gray.shape[:2]
+    too_big = (h * w) * 0.6
+    for i in range(1, num_labels):
+        if stats[i, cv2.CC_STAT_AREA] > too_big:
+            mask[labels == i] = 0
+    return mask
+
+def inpaint_crop_with_mask(crop_rgb, mask, radius=3, method="telea"):
+    """
+    針對整個裁切區域做 inpaint（OpenCV），用遮罩把筆劃抹掉並補背景。
+    """
+    bgr = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2BGR)
+    flag = cv2.INPAINT_TELEA if method.lower() != "ns" else cv2.INPAINT_NS
+    mask_u8 = (mask > 0).astype(np.uint8) * 255
+    out = cv2.inpaint(bgr, mask_u8, float(radius), flag)
+    return cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
+
+def paste_inpaint_then_text_using_box(img_pil_full, box, text, vertical_mode):
+    """
+    先針對「使用者框選的整塊 box」自動產生遮罩並 inpaint，
+    再把譯文畫上去。
+    """
+    x1, y1, x2, y2 = box
+    crop_np = np.array(img_pil_full)[y1:y2, x1:x2, :]
+    if crop_np.size == 0:
+        return
+    # 自動產生遮罩並 inpaint
+    mask = build_text_mask_from_crop_auto(crop_np, dilate_px=3)
+    crop_inpaint = inpaint_crop_with_mask(crop_np, mask, radius=3, method="telea")
+
+    # 先把 inpaint 好的底圖貼回去
+    img_pil_full.paste(Image.fromarray(crop_inpaint), (x1, y1))
+
+    # 接著在貼回後的底圖上做原本的直/橫排文字排版（沿用你現有的版型）
+    draw_full = ImageDraw.Draw(img_pil_full)
+    box_w = max(1, x2 - x1)
+    box_h = max(1, y2 - y1)
+
+    if vertical_mode:
+        dummy = Image.new("RGB", (box_w, box_h), (0, 0, 0))
+        d = ImageDraw.Draw(dummy)
+        font, cols, step_h, col_w = layout_vertical(d, text, box_w, box_h)
+        total_w = col_w * len(cols)
+        total_h = step_h * (max(len(c) for c in cols) if cols else 1)
+        x0 = x1 + max(0, (box_w - total_w) // 2)
+        y0 = y1 + max(0, (box_h - total_h) // 2)
+        for ci, col in enumerate(cols):
+            cx = x0 + ci * col_w
+            cy = y0
+            for ch in col:
+                draw_text_with_stroke(draw_full, (cx, cy), ch, font,
+                                        fill=(255, 255, 255), stroke_fill=(0, 0, 0),
+                                        stroke_width=max(2, font.size // 12))
+                cy += step_h
+    else:
+        dummy = Image.new("RGB", (box_w, box_h), (0, 0, 0))
+        d = ImageDraw.Draw(dummy)
+        font, lines2, line_h = layout_horizontal(d, text, box_w, box_h)
+        total_h = line_h * len(lines2)
+        y0 = y1 + max(0, (box_h - total_h) // 2)
+        for i, ln in enumerate(lines2):
+            w2, _ = measure_line(d, ln, font)
+            x = x1 + max(0, (box_w - w2) // 2)
+            y = y0 + i * line_h
+            draw_text_with_stroke(draw_full, (x, y), ln, font,
+                                    fill=(255, 255, 255), stroke_fill=(0, 0, 0),
+                                    stroke_width=max(2, font.size // 12))
+
+def render_preview_on_inpainted_crop(crop_inpaint_rgb, text, vertical_mode):
+    """
+    crop_inpaint_rgb: 已 inpaint 的裁切區域 (H,W,3) RGB
+    text: 需顯示的翻譯文字
+    vertical_mode: 是否直排
+    回傳：BGR numpy，用於 cv2.imshow
+    """
+    crop_pil = Image.fromarray(crop_inpaint_rgb)  # 直接拿 inpaint 後底圖
+    draw_crop = ImageDraw.Draw(crop_pil)
+    box_w, box_h = crop_pil.size
+
+    if vertical_mode:
+        font, cols, step_h, col_w = layout_vertical(draw_crop, text, box_w, box_h)
+        total_w = col_w * len(cols)
+        total_h = step_h * (max(len(c) for c in cols) if cols else 1)
+        x0 = max(0, (box_w - total_w) // 2)
+        y0 = max(0, (box_h - total_h) // 2)
+        for ci, col in enumerate(cols):
+            cx = x0 + ci * col_w
+            cy = y0
+            for ch in col:
+                draw_text_with_stroke(draw_crop, (cx, cy), ch, font,
+                                        fill=(255, 255, 255),
+                                        stroke_fill=(0, 0, 0),
+                                        stroke_width=max(2, font.size // 12))
+                cy += step_h
+    else:
+        font, lines, line_h = layout_horizontal(draw_crop, text, box_w, box_h)
+        total_h = line_h * len(lines)
+        y0 = max(0, (box_h - total_h) // 2)
+        for i, ln in enumerate(lines):
+            w, _ = measure_line(draw_crop, ln, font)
+            x = max(0, (box_w - w) // 2)
+            y = y0 + i * line_h
+            draw_text_with_stroke(draw_crop, (x, y), ln, font,
+                                    fill=(255, 255, 255),
+                                    stroke_fill=(0, 0, 0),
+                                    stroke_width=max(2, font.size // 12))
+
+    # 顯示前做尺寸限制，避免視窗過大
+    prev_bgr = cv2.cvtColor(np.array(crop_pil), cv2.COLOR_RGB2BGR)
+    ph, pw = prev_bgr.shape[:2]
+    pmax = max(ph, pw)
+    if pmax > 720:
+        s = pmax / 720.0
+        prev_bgr = cv2.resize(prev_bgr, (int(pw / s), int(ph / s)), interpolation=cv2.INTER_AREA)
+    return prev_bgr
+
+def upload_and_translate_image():
+    """
+      - 點按鈕：清空 GUI 並顯示一次操作說明
+      - 使用者可一次選多張圖；對每張圖依序執行：
+          1) 顯示圖(最長邊≤1080) → 多區域框選（Enter 完成 / Esc 取消該張）
+          2) 逐框 OCR+翻譯 → 預覽（V=直排/H=橫排；Y=回填 / N/Esc=跳過）
+          3) 回填到原圖
+          4) 若有至少一個 Y 才存到 SAVE_DIR/<檔名>_translated.png；若全是 N 則不存
+      - 結束一張後自動進入下一張；全部做完即結束
+    """
+    # —— 主執行緒：清空 GUI 並顯示一次說明（本次多圖批次只顯示一次）——
+    try:
+        gui_queue.put("__CLEAR__")
+        gui_queue.put((
+            "【操作說明】在框選視窗用滑鼠拖曳可多選；Enter 完成框選、Esc 取消該張。\n"
+            "每個預覽窗：Y=回填、N/Esc=跳過、V=直排、H=橫排。\n"
+            "可一次選多張圖片，會依序處理。\n",
+            "zh_color"
+        ))
+    except Exception:
+        pass
+
+    def _worker():
+        # -------------- 1) 選檔（多選） --------------
+        filepaths = filedialog.askopenfilenames(
+            title="選擇要翻譯的圖片（可多選）",
+            filetypes=[("Images", "*.png;*.jpg;*.jpeg;*.bmp;*.webp")]
+        )
+        if not filepaths:
+            return
+
+        # -------------- 2) 初始化 OCR/翻譯（一次） --------------
+        lang_sel = language_var.get() if 'language_var' in globals() else "japanese"
+        if lang_sel == "japanese":
+            ocr_lang = "japan"
+        elif lang_sel == "english":
+            ocr_lang = "en"
+        elif lang_sel == "chinese":
+            ocr_lang = "ch"
+        else:
+            ocr_lang = "japan"
+        load_paddleocr(ocr_lang)
+        use_context = context_var.get() if 'context_var' in globals() else False
+
+        # -------------- 3) 逐張圖片處理 --------------
+        for idx_img, filepath in enumerate(filepaths, 1):
+            try:
+                # 用 PIL 讀，避免 cv2 在中文路徑失敗
+                img_pil_full = Image.open(filepath).convert("RGB")
+            except Exception as e:
+                put_log(f"[{idx_img}/{len(filepaths)}] 讀取失敗：{filepath}\n")
+                continue
+
+            orig_w, orig_h = img_pil_full.size
+            draw_full = ImageDraw.Draw(img_pil_full)
+
+            # 顯示圖 ≤1080
+            img_cv_disp = cv2.cvtColor(np.array(img_pil_full), cv2.COLOR_RGB2BGR)
+            disp_h, disp_w = img_cv_disp.shape[:2]
+            max_side = max(disp_h, disp_w)
+            if max_side > 1080:
+                scale = max_side / 1080.0
+                new_w = int(disp_w / scale)
+                new_h = int(disp_h / scale)
+                img_cv_disp = cv2.resize(img_cv_disp, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                put_log(f"[{idx_img}/{len(filepaths)}] 圖片已縮放到 {new_w}x{new_h} 顯示。\n")
+            else:
+                new_w, new_h = disp_w, disp_h
+            sx = orig_w / float(new_w)
+            sy = orig_h / float(new_h)
+
+            base_disp = img_cv_disp.copy()
+            cur_disp = img_cv_disp.copy()
+
+            # 多框選
+            selecting = False
+            start_pt = None
+            boxes_disp = []
+
+            win_select = f"選取文字區域 - {os.path.basename(filepath)} (Enter 完成 / Esc 取消)"
+            cv2.namedWindow(win_select)
+
+            def mouse_cb(event, x, y, flags, param):
+                nonlocal selecting, start_pt, cur_disp, base_disp
+                if event == cv2.EVENT_LBUTTONDOWN:
+                    selecting = True
+                    start_pt = (x, y)
+                elif event == cv2.EVENT_MOUSEMOVE and selecting:
+                    cur_disp = base_disp.copy()
+                    cv2.rectangle(cur_disp, start_pt, (x, y), (0, 255, 0), 2)
+                elif event == cv2.EVENT_LBUTTONUP:
+                    selecting = False
+                    x1, y1 = start_pt
+                    x2, y2 = (x, y)
+                    xd1, xd2 = sorted([x1, x2])
+                    yd1, yd2 = sorted([y1, y2])
+                    xd1 = max(0, min(xd1, new_w - 1)); xd2 = max(0, min(xd2, new_w - 1))
+                    yd1 = max(0, min(yd1, new_h - 1)); yd2 = max(0, min(yd2, new_h - 1))
+                    if xd2 - xd1 >= 5 and yd2 - yd1 >= 5:
+                        boxes_disp.append((xd1, yd1, xd2, yd2))
+                        cv2.rectangle(base_disp, (xd1, yd1), (xd2, yd2), (0, 0, 255), 2)
+                        cur_disp = base_disp.copy()
+                        put_log(f"[{idx_img}/{len(filepaths)}] 已選取區域(顯示座標): {xd1},{yd1},{xd2},{yd2}\n")
+
+            cv2.setMouseCallback(win_select, mouse_cb)
+
+            # 非阻塞輪詢
+            cancel_this_image = False
+            while True:
+                cv2.imshow(win_select, cur_disp)
+                key = cv2.waitKey(20) & 0xFF
+                if key == 13:   # Enter 完成
+                    break
+                elif key == 27: # Esc 取消該張
+                    cancel_this_image = True
+                    break
+            try:
+                cv2.destroyWindow(win_select)
+            except Exception:
+                pass
+
+            if cancel_this_image:
+                put_log(f"[{idx_img}/{len(filepaths)}] 已取消此圖片。\n")
+                # 安全關閉預覽殘窗
+                try: cv2.destroyAllWindows()
+                except: pass
+                continue
+
+            if not boxes_disp:
+                put_log(f"[{idx_img}/{len(filepaths)}] 未選取任何區域，略過此圖片。\n")
+                try: cv2.destroyAllWindows()
+                except: pass
+                continue
+
+            # 映射至原圖座標
+            boxes_orig = []
+            for xd1, yd1, xd2, yd2 in boxes_disp:
+                xo1 = int(round(xd1 * sx)); yo1 = int(round(yd1 * sy))
+                xo2 = int(round(xd2 * sx)); yo2 = int(round(yd2 * sy))
+                xo1, xo2 = sorted([max(0, min(xo1, orig_w - 1)), max(0, min(xo2, orig_w - 1))])
+                yo1, yo2 = sorted([max(0, min(yo1, orig_h - 1)), max(0, min(yo2, orig_h - 1))])
+                if xo2 - xo1 >= 5 and yo2 - yo1 >= 5:
+                    boxes_orig.append((xo1, yo1, xo2, yo2))
+                    put_log(f"[{idx_img}/{len(filepaths)}] 對應原圖區域: {xo1},{yo1},{xo2},{yo2}\n")
+
+            if not boxes_orig:
+                put_log(f"[{idx_img}/{len(filepaths)}] 映射後無有效區域，略過此圖片。\n")
+                try: cv2.destroyAllWindows()
+                except: pass
+                continue
+
+            # 逐框 OCR/翻譯/預覽 → 收集回填
+            to_paste = []  # (x1,y1,x2,y2, zh, vertical_mode)
+            PREVIEW_WIN = f"預覽 - {os.path.basename(filepath)}"
+
+            for i, (x1, y1, x2, y2) in enumerate(boxes_orig, 1):
+                crop_np = np.array(img_pil_full)[y1:y2, x1:x2, :]
+                if crop_np.size == 0:
+                    put_log(f"[{idx_img}/{len(filepaths)}][區域 {i}] 裁切為空，跳過。\n")
+                    continue
+
+                # OCR（放大+多路增強擇優）
+                lines, text_detected, avg_score, best_idx = ocr_best_of_upscaled(crop_np)
+                if not text_detected.strip():
+                    put_log(f"[{idx_img}/{len(filepaths)}][區域 {i}] OCR 無內容，跳過。\n")
+                    continue
+                put_log(f"[{idx_img}/{len(filepaths)}][區域 {i}] OCR 置信平均分數: {avg_score:.3f}\n")
+
+                # 翻譯
+                try:
+                    zh = gguf_translate_text_to_chinese(text_detected) if use_context else gguf_translate_text_direct(text_detected)
+                except Exception:
+                    zh = text_detected
+                put_log(f"[{idx_img}/{len(filepaths)}][區域 {i}] {text_detected} => {zh}\n", "zh_color")
+
+                # 初始方向
+                try:
+                    vertical_mode = orientation_var.get().startswith("vertical")
+                except Exception:
+                    # 極端情況才退回自動判斷
+                    vertical_mode = infer_vertical_from_ocr_lines(lines)
+
+                _auto_mask = build_text_mask_from_crop_auto(crop_np, dilate_px=3)
+                _crop_inpaint = inpaint_crop_with_mask(crop_np, _auto_mask, radius=3, method="telea")
+
+                # 非阻塞預覽迴圈（允許 V/H 切換）
+                while True:
+                    prev_bgr = render_preview_on_inpainted_crop(_crop_inpaint, zh, vertical_mode)
+                    cv2.imshow(PREVIEW_WIN, prev_bgr)
+                    k = cv2.waitKey(20) & 0xFF
+                    if k in (ord('y'), ord('Y')):
+                        to_paste.append((x1, y1, x2, y2, zh, vertical_mode))
+                        try:
+                            cv2.destroyWindow(PREVIEW_WIN)
+                        except Exception:
+                            pass
+                        put_log(f"[{idx_img}/{len(filepaths)}][區域 {i}] → 已加入回填清單。\n")
+                        break
+                    elif k in (ord('n'), ord('N'), 27):  # N 或 Esc
+                        try:
+                            cv2.destroyWindow(PREVIEW_WIN)
+                        except Exception:
+                            pass
+                        put_log(f"[{idx_img}/{len(filepaths)}][區域 {i}] → 跳過此框。\n")
+                        break
+                    elif k in (ord('v'), ord('V')):
+                        vertical_mode = True
+                    elif k in (ord('h'), ord('H')):
+                        vertical_mode = False
+                    # 其他鍵：忽略，持續輪詢
+
+            # 統一回填（to_paste 為空就不回填）
+            for (x1, y1, x2, y2, zh, vertical_mode) in to_paste:
+                paste_inpaint_then_text_using_box(img_pil_full, (x1, y1, x2, y2), zh, vertical_mode)
+
+            # 存檔（只有在有至少一個 Y 時才存）
+            base = os.path.splitext(os.path.basename(filepath))[0]
+            out_path = os.path.join(SAVE_DIR, f"{base}_translated.png")
+            if to_paste:
+                try:
+                    img_pil_full.save(out_path)
+                    put_log(f"[{idx_img}/{len(filepaths)}] 【完成】已輸出：{out_path}\n", "zh_color")
+                except Exception as e:
+                    put_log(f"[{idx_img}/{len(filepaths)}] 存檔失敗：{out_path}\n")
+            else:
+                put_log(f"[{idx_img}/{len(filepaths)}] 未選擇任何框回填，未輸出圖片。\n", "zh_color")
+
+            # 清理殘視窗（保險）
+            try:
+                cv2.destroyAllWindows()
+            except Exception:
+                pass
+
+        # 全部處理完
+        put_log("【批次完成】所有選取圖片皆已處理。\n", "zh_color")
+
+    # 啟動背景執行緒（daemon=True 讓程式結束時不阻塞）
+    threading.Thread(target=_worker, daemon=True).start()
+
+def _bgr_image_to_png_b64(img_bgr) -> str:
+    """把 BGR 的 np.ndarray 轉成 PNG base64。"""
+    ok, buf = cv2.imencode(".png", img_bgr)
+    if not ok:
+        return ""
+    return base64.b64encode(buf.tobytes()).decode("utf-8")
+
+def vlm_recognize_text_from_bgr(crop_bgr) -> str:
+    """
+    直接把裁切的 BGR 影像陣列送進 VLM（Ollama），回傳模型輸出的文字。
+    """
+    b64 = _bgr_image_to_png_b64(crop_bgr)
+    if not b64:
+        return ""
+
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": [{
+            "role": "user",
+            "content": "辨識這張圖中的文字並提取出來，只要回覆文字給我，不要解釋或翻譯。",
+            "images": [b64],
+        }],
+        "stream": False,
+        "options": {
+            "num_gpu": 15      # 看模型大小去測試 3b:35 7b:15
+        }
+    }
+    try:
+        r = requests.post(OLLAMA_URL, json=payload, timeout=600)
+        resp = r.json()
+        msg = resp.get("message", {})
+        content = (msg.get("content") or "").strip()
+        return content
+    except Exception:
+        return ""
+
+def upload_and_translate_image_vlm():
+    """與 upload_and_translate_image 幾乎相同，但 OCR 改為 VLM，且不做增強打分。"""
+    try:
+        gui_queue.put("__CLEAR__")
+        gui_queue.put((
+            "【操作說明】在框選視窗用滑鼠拖曳可多選；Enter 完成框選、Esc 取消該張。\n"
+            "每個預覽窗：Y=回填、N/Esc=跳過、V=直排、H=橫排。\n"
+            "可一次選多張圖片，會依序處理。\n",
+            "zh_color"
+        ))
+    except Exception:
+        pass
+    global vlm_active
+    vlm_active = True
+    try:
+        update_unload_button_state()  
+    except Exception:
+        pass
+    def _worker():
+        filepaths = filedialog.askopenfilenames(
+            title="選擇要翻譯的圖片（可多選）",
+            filetypes=[("Images", "*.png;*.jpg;*.jpeg;*.bmp;*.webp")]
+        )
+        if not filepaths:
+            return
+
+        use_context = context_var.get() if 'context_var' in globals() else False
+
+        for idx_img, filepath in enumerate(filepaths, 1):
+            try:
+                img_pil_full = Image.open(filepath).convert("RGB")
+                img_np_full = np.array(img_pil_full)[:, :, ::-1]  # to BGR
+                h, w = img_np_full.shape[:2]
+                scale = 1080.0 / max(h, w) if max(h, w) > 1080 else 1.0
+                disp_bgr = cv2.resize(img_np_full, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_AREA)
+
+                boxes_disp = []
+                selecting = False
+                start_pt = (0, 0)
+                base_disp = disp_bgr.copy()   # 保存所有固定的紅框
+                cur_disp = base_disp.copy()   # 隨滑鼠移動的畫面
+
+                def mouse_cb(event, x, y, flags, param):
+                    nonlocal selecting, start_pt, cur_disp, base_disp
+                    if event == cv2.EVENT_LBUTTONDOWN:
+                        selecting = True
+                        start_pt = (x, y)
+                    elif event == cv2.EVENT_MOUSEMOVE and selecting:
+                        cur_disp = base_disp.copy()
+                        cv2.rectangle(cur_disp, start_pt, (x, y), (0, 255, 0), 2)
+                    elif event == cv2.EVENT_LBUTTONUP:
+                        selecting = False
+                        x1, y1 = start_pt
+                        x2, y2 = (x, y)
+                        xd1, xd2 = sorted([x1, x2])
+                        yd1, yd2 = sorted([y1, y2])
+                        xd1 = max(0, min(xd1, disp_bgr.shape[1]-1))
+                        xd2 = max(0, min(xd2, disp_bgr.shape[1]-1))
+                        yd1 = max(0, min(yd1, disp_bgr.shape[0]-1))
+                        yd2 = max(0, min(yd2, disp_bgr.shape[0]-1))
+                        if xd2 - xd1 >= 5 and yd2 - yd1 >= 5:
+                            boxes_disp.append((xd1, yd1, xd2, yd2))
+                            cv2.rectangle(base_disp, (xd1, yd1), (xd2, yd2), (0, 0, 255), 2)
+                            cur_disp = base_disp.copy()
+
+                cv2.namedWindow("Select")
+                cv2.setMouseCallback("Select", mouse_cb)
+                while True:
+                    cv2.imshow("Select", cur_disp)
+                    k = cv2.waitKey(20) & 0xFF
+                    if k == 13:  # Enter
+                        break
+                    elif k == 27:  # Esc → 取消這張
+                        boxes_disp = []
+                        break
+                cv2.destroyWindow("Select")
+
+                # 把顯示座標轉回原圖座標
+                boxes_orig = []
+                for (xd1, yd1, xd2, yd2) in boxes_disp:
+                    rx1, ry1 = int(xd1/scale), int(yd1/scale)
+                    rx2, ry2 = int(xd2/scale), int(yd2/scale)
+                    if rx2 > rx1 and ry2 > ry1:
+                        boxes_orig.append((rx1, ry1, rx2, ry2))
+                if not boxes_orig:
+                    continue
+
+                to_paste = []
+                for i, (x1,y1,x2,y2) in enumerate(boxes_orig,1):
+                    crop = img_np_full[y1:y2, x1:x2]
+                    if crop.size == 0:
+                        continue
+                    # 縮放長邊 ≤1080
+                    ch, cw = crop.shape[:2]
+                    s = 1080.0 / max(ch,cw) if max(ch,cw)>1080 else 1.0
+                    crop_resized = cv2.resize(crop,(int(cw*s),int(ch*s)), interpolation=cv2.INTER_AREA)
+
+                    text_detected = vlm_recognize_text_from_bgr(crop_resized)
+
+                    if not text_detected:
+                        put_log(f"[{idx_img}/{len(filepaths)}][區域 {i}] VLM 無結果，略過。\n")
+                        continue
+
+                    try:
+                        zh = gguf_translate_text_to_chinese(text_detected) if use_context else gguf_translate_text_direct(text_detected)
+                    except Exception:
+                        zh = text_detected
+
+                    put_log(f"[{idx_img}/{len(filepaths)}][區域 {i}] {text_detected} => {zh}\n","zh_color")
+
+                    try:
+                        vertical_mode = orientation_var.get().startswith("vertical")
+                    except Exception:
+                        vertical_mode = True
+
+                    _auto_mask = build_text_mask_from_crop_auto(crop, dilate_px=3)
+                    _crop_inpaint = inpaint_crop_with_mask(crop, _auto_mask, radius=3, method="telea")
+
+                    while True:
+                        prev_bgr = render_preview_on_inpainted_crop(_crop_inpaint, zh, vertical_mode)
+                        cv2.imshow("Preview", prev_bgr)
+                        k = cv2.waitKey(20) & 0xFF
+                        if k in (ord('y'),ord('Y')):
+                            to_paste.append((x1,y1,x2,y2, zh, vertical_mode))
+                            cv2.destroyWindow("Preview")
+                            break
+                        elif k in (ord('n'),ord('N'),27):
+                            cv2.destroyWindow("Preview")
+                            break
+                        elif k in (ord('v'),ord('V')):
+                            vertical_mode = True
+                        elif k in (ord('h'),ord('H')):
+                            vertical_mode = False
+
+                for (x1,y1,x2,y2,zh,vertical_mode) in to_paste:
+                    paste_inpaint_then_text_using_box(img_pil_full,(x1,y1,x2,y2),zh,vertical_mode)
+
+                base = os.path.splitext(os.path.basename(filepath))[0]
+                out_path = os.path.join(SAVE_DIR,f"{base}_translated.png")
+                if to_paste:
+                    img_pil_full.save(out_path)
+                    put_log(f"[{idx_img}/{len(filepaths)}] 【完成】已輸出：{out_path}\n","zh_color")
+                else:
+                    put_log(f"[{idx_img}/{len(filepaths)}] 未輸出圖片。\n")
+            except Exception as e:
+                put_log(f"[{idx_img}/{len(filepaths)}] 處理失敗: {e}\n")
+        put_log("【批次完成】所有選取圖片皆已處理。\n","zh_color")
+
+    threading.Thread(target=_worker,daemon=True).start()
+
 def check_threads_end():
     # 若 record_thread 和 transcribe_thread 均為 None 或不存活，則認為已停止
     if ((record_thread is None) or (not record_thread.is_alive())) and \
@@ -1080,6 +1989,13 @@ stop_button = tk.Button(
     width=15, bg='red', fg='white', state=tk.DISABLED
 )
 stop_button.pack(side=tk.LEFT, padx=10)
+
+upload_btn = tk.Button(
+    button_frame, text="上傳圖片翻譯",
+    command=lambda: upload_and_translate_image_vlm() if use_ollama_var.get() else upload_and_translate_image(),
+    width=18
+)
+upload_btn.pack(side=tk.LEFT, padx=10)
 # ========== 讀寫記憶 ==========
 
 def load_short_term_memory():
@@ -1126,7 +2042,6 @@ def save_short_term_memory(memory_data):
     """
     with open(JSON_MEMORY_FILE, "w", encoding="utf-8") as f:
         json.dump(memory_data, f, ensure_ascii=False, indent=2)
-
 
 def on_close():
     global record_thread, transcribe_thread
