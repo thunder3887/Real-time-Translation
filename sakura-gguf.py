@@ -2060,10 +2060,3 @@ root.protocol("WM_DELETE_WINDOW", on_close)
 # 開始 GUI 更新循環
 root.after(100, update_gui)
 root.mainloop()
-
-try:
-    stream.stop_stream()
-    stream.close()
-    audio.terminate()
-except Exception as e:
-    print(f"關閉音頻流時出錯: {e}")
